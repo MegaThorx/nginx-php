@@ -1,71 +1,238 @@
 name: Build image
 
+# Checks every supported PHP version daily and rebuilds it when its PHP release, base image,
+# Alpine packages, PECL extensions or this repository's Dockerfile/config changed.
+# See scripts/versions.py for the rules.
+
 on:
+  schedule:
+    - cron: "17 3 * * *"
   push:
-    branches: [ main ]
+    branches: [main]
+    paths:
+      - Dockerfile
+      - conf/**
+      - src/**
+      - scripts/**
+      - .github/workflows/build-image.yml
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild every supported PHP version even if nothing changed
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-image
+
 env:
-  IMAGE_ID: "ghcr.io/megathorx/nginx-php" 
+  IMAGE: ghcr.io/megathorx/nginx-php
+  LABEL_PREFIX: io.github.megathorx.nginx-php
+
+permissions:
+  contents: read
 
 jobs:
-  push:
-    runs-on: ubuntu-latest
+  versions:
+    name: Decide what to build
+    # Images are only published from main
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
     permissions:
-      packages: write
       contents: read
-
+      actions: write
+    outputs:
+      has_builds: ${{ steps.versions.outputs.has_builds }}
+      build_matrix: ${{ steps.versions.outputs.build_matrix }}
+      merge_matrix: ${{ steps.versions.outputs.merge_matrix }}
+      imagick_version: ${{ steps.versions.outputs.imagick_version }}
+      redis_version: ${{ steps.versions.outputs.redis_version }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3.5.2
-    
-      - name: Docker Setup QEMU
-        uses: docker/setup-qemu-action@v2.1.0
-        
-      - name: Docker Setup Buildx
-        uses: docker/setup-buildx-action@v2.5.0
-      
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v2
+      - uses: actions/checkout@v7
+
+      - name: Unit tests
+        run: python3 -m unittest discover -s scripts
+
+      - name: Check PHP versions and published images
+        id: versions
+        env:
+          FORCE: ${{ inputs.force }}
+        run: python3 scripts/versions.py
+
+      # GitHub disables scheduled workflows after 60 days without repository activity
+      - name: Keep the schedule enabled
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method PUT "repos/${{ github.repository }}/actions/workflows/build-image.yml/enable"
+
+  build:
+    name: PHP ${{ matrix.cycle }} (${{ matrix.arch }})
+    needs: versions
+    if: needs.versions.outputs.has_builds == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.versions.outputs.build_matrix) }}
+    env:
+      TEST_IMAGE: nginx-php-test:${{ matrix.cycle }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push Docker images for 7.4
-        uses: docker/build-push-action@v4.0.0
+      # No cache, so Alpine package updates are always picked up. The base image is pinned
+      # to the digest versions.py recorded, so the labels describe exactly what was built.
+      - name: Build
+        uses: docker/build-push-action@v7
         with:
-          context: "{{defaultContext}}:."
-          file: "7.4/Dockerfile"
-          labels: "runnumber=${GITHUB_RUN_ID}"
-          platforms: "linux/amd64,linux/arm64"
-          push: true
-          tags: "${{ env.IMAGE_ID }}:7.4"
-      
-      - name: Build and push Docker images for 8.0
-        uses: docker/build-push-action@v4.0.0
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-contexts: php:${{ matrix.cycle }}-fpm-alpine=docker-image://${{ matrix.base }}
+          build-args: |
+            PHP_VERSION=${{ matrix.cycle }}
+            IMAGICK_VERSION=${{ needs.versions.outputs.imagick_version }}
+            REDIS_VERSION=${{ needs.versions.outputs.redis_version }}
+          no-cache: true
+          load: true
+          tags: ${{ env.TEST_IMAGE }}
+
+      - name: Smoke test
+        id: smoke
+        run: scripts/smoke-test.sh "$TEST_IMAGE" "${{ matrix.cycle }}"
+
+      # Same build again, served from the builder's cache of the tested build above
+      # (only the labels differ), pushed by digest
+      - name: Push
+        id: push
+        uses: docker/build-push-action@v7
         with:
-          context: "{{defaultContext}}:."
-          file: "8.0/Dockerfile"
-          labels: "runnumber=${GITHUB_RUN_ID}"
-          platforms: "linux/amd64,linux/arm64"
-          push: true
-          tags: "${{ env.IMAGE_ID }}:8.0"
-      
-      - name: Build and push Docker images for 8.1
-        uses: docker/build-push-action@v4.0.0
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-contexts: php:${{ matrix.cycle }}-fpm-alpine=docker-image://${{ matrix.base }}
+          build-args: |
+            PHP_VERSION=${{ matrix.cycle }}
+            IMAGICK_VERSION=${{ needs.versions.outputs.imagick_version }}
+            REDIS_VERSION=${{ needs.versions.outputs.redis_version }}
+          labels: |
+            ${{ matrix.labels }}
+            org.opencontainers.image.title=nginx-php
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.smoke.outputs.php_version }}
+            ${{ env.LABEL_PREFIX }}.nginx.version=${{ steps.smoke.outputs.nginx_version }}
+            ${{ env.LABEL_PREFIX }}.alpine.version=${{ steps.smoke.outputs.alpine_version }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          PHP_VERSION: ${{ steps.smoke.outputs.php_version }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digest"
+          echo "$DIGEST" > "$RUNNER_TEMP/digest/digest-${{ matrix.arch }}"
+          echo "$PHP_VERSION" > "$RUNNER_TEMP/digest/php-${{ matrix.arch }}"
+
+      - uses: actions/upload-artifact@v7
         with:
-          context: "{{defaultContext}}:."
-          file: "8.1/Dockerfile"
-          labels: "runnumber=${GITHUB_RUN_ID}"
-          platforms: "linux/amd64,linux/arm64"
-          push: true
-          tags: "${{ env.IMAGE_ID }}:8.1"
-      
-      - name: Build and push Docker images for 8.2
-        uses: docker/build-push-action@v4.0.0
+          name: digest-${{ matrix.cycle }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digest/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Publish PHP ${{ matrix.cycle }}
+    needs: [versions, build]
+    if: ${{ !cancelled() && needs.versions.outputs.has_builds == 'true' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.versions.outputs.merge_matrix) }}
+    steps:
+      - uses: actions/download-artifact@v8
+        continue-on-error: true
         with:
-          context: "{{defaultContext}}:."
-          file: "8.2/Dockerfile"
-          labels: "runnumber=${GITHUB_RUN_ID}"
-          platforms: "linux/amd64,linux/arm64"
-          push: true
-          tags: "${{ env.IMAGE_ID }}:8.2,${{ env.IMAGE_ID }}:latest"
+          pattern: digest-${{ matrix.cycle }}-*
+          path: ${{ runner.temp }}/digest
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Only publish when both architectures built and passed their smoke test
+      - name: Create multi-platform tags
+        env:
+          CYCLE: ${{ matrix.cycle }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digest"
+          cd "$RUNNER_TEMP/digest"
+          for arch in amd64 arm64; do
+            if [ ! -s "digest-$arch" ]; then
+              echo "::warning::PHP $CYCLE: the $arch build failed, nothing published for $CYCLE"
+              exit 0
+            fi
+          done
+          php_version=$(cat php-amd64)
+          if [ "$php_version" != "$(cat php-arm64)" ]; then
+            echo "::error::PHP $CYCLE: amd64 has $php_version but arm64 has $(cat php-arm64)"
+            exit 1
+          fi
+          docker buildx imagetools create \
+            --tag "$IMAGE:$CYCLE" \
+            --tag "$IMAGE:$php_version" \
+            "$IMAGE@$(cat digest-amd64)" \
+            "$IMAGE@$(cat digest-arm64)"
+          docker buildx imagetools inspect "$IMAGE:$CYCLE"
+
+  publish:
+    name: Shared tags and README
+    needs: [versions, build, merge]
+    if: ${{ !cancelled() && needs.versions.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Point latest and major tags at the newest images
+        run: python3 scripts/shared-tags.py
+
+      - name: Update README
+        run: python3 scripts/update-readme.py
+
+      # Committed as the user behind the run (for the schedule: whoever last changed it)
+      - name: Commit README
+        run: |
+          git diff --quiet README.md && exit 0
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
+          git commit -m "docs: update image list" README.md
+          git push
