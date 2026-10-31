@@ -54,8 +54,8 @@ This list is updated automatically.
 
 - nginx on port 80, serving `/var/www/html`, and PHP-FPM on a unix socket, both run by supervisord.
   Logs go to stdout/stderr.
-- PHP extensions on top of the official image: `gd` (freetype, jpeg, webp), `imagick`, `redis`, `intl`, `mysqli`,
-  `pdo_mysql`, `pdo_sqlite`, `exif`, `soap`, `xsl`, `zip`, `opcache`, `dom`.
+- PHP extensions on top of the official image: `gd` (freetype, jpeg, webp), `imagick`, `redis`, `intl`, `gmp`,
+  `mysqli`, `pdo_mysql`, `pdo_sqlite`, `exif`, `soap`, `xsl`, `zip`, `opcache`, `dom`.
 - PHP settings: `memory_limit = 512M`, `upload_max_filesize` and `post_max_size` `100M`, `variables_order = "EGPCS"`,
   `cgi.fix_pathinfo = 0`, and `clear_env = no`, so environment variables reach PHP.
 - nginx: `client_max_body_size 100m`, the real client IP from `X-Forwarded-For` for proxies in `172.16.0.0/12`,

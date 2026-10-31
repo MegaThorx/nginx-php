@@ -28,6 +28,7 @@ RUN set -eux; \
         libjpeg-turbo-dev \
         libpng-dev \
         libwebp-dev \
+        gmp-dev \
         icu-dev \
         libzip-dev \
         libxslt-dev \
@@ -41,7 +42,7 @@ RUN set -eux; \
         curl -fsSL "https://pecl.php.net/get/$ext.tgz" | tar -xz --strip-components=1 -C "$dir"; \
     done; \
     docker-php-ext-configure gd --with-freetype --with-webp --with-jpeg; \
-    docker-php-ext-install -j"$(nproc)" pdo_mysql mysqli gd exif intl xsl soap zip imagick redis; \
+    docker-php-ext-install -j"$(nproc)" pdo_mysql mysqli gd exif gmp intl xsl soap zip imagick redis; \
     # OPcache is compiled in from PHP 8.5 on
     php -m | grep -qix 'zend opcache' || docker-php-ext-install -j"$(nproc)" opcache; \
     runDeps="$( \

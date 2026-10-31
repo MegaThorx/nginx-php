@@ -11,7 +11,7 @@ cycle=$2
 port=${SMOKE_TEST_PORT:-8080}
 name="smoke-test-$$"
 
-extensions=(dom exif gd imagick intl mysqli pdo_mysql pdo_sqlite redis soap xsl zip "Zend OPcache")
+extensions=(dom exif gd gmp imagick intl mysqli pdo_mysql pdo_sqlite redis soap xsl zip "Zend OPcache")
 
 fail() {
     echo "FAIL: $*" >&2
